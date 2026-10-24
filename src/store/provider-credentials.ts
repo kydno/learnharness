@@ -39,6 +39,7 @@ import type {
 	CredentialStore,
 } from "@earendil-works/pi-ai";
 import { PATHS } from "../../config.ts";
+import { type CredentialCipher, isEncryptedEnvelope, keychainCipher } from "./credential-cipher.ts";
 
 export type CredentialStoreErrorCode =
 	| "invalid_id"
@@ -62,6 +63,8 @@ export interface ProviderCredentialStoreOptions {
 	lockTimeoutMs?: number;
 	/** Poll interval while waiting for the lock. Default 25ms. */
 	pollMs?: number;
+	/** Encrypt the file at rest (AES-256-GCM envelope). Omitted = plaintext 0600 JSON. */
+	cipher?: CredentialCipher;
 }
 
 export interface ProviderCredentialStore extends CredentialStore {
@@ -150,6 +153,7 @@ class FileProviderCredentialStore implements ProviderCredentialStore {
 	private readonly lockDir: string;
 	private readonly lockTimeoutMs: number;
 	private readonly pollMs: number;
+	private readonly cipher: CredentialCipher | undefined;
 
 	constructor(filePath: string, opts: ProviderCredentialStoreOptions = {}) {
 		this.file = path.resolve(filePath);
@@ -157,6 +161,7 @@ class FileProviderCredentialStore implements ProviderCredentialStore {
 		this.lockDir = `${this.file}.lock`;
 		this.lockTimeoutMs = opts.lockTimeoutMs ?? 10_000;
 		this.pollMs = opts.pollMs ?? 25;
+		this.cipher = opts.cipher;
 	}
 
 	// ---- path safety -------------------------------------------------
@@ -216,6 +221,15 @@ class FileProviderCredentialStore implements ProviderCredentialStore {
 	}
 
 	private parse(text: string): State {
+		if (isEncryptedEnvelope(text)) {
+			// Fail closed: an encrypted file is never read as, or replaced by, plaintext.
+			if (!this.cipher) throw new CredentialStoreError("io", "Credential file is encrypted and no key is available.");
+			try {
+				text = this.cipher.decrypt(text);
+			} catch {
+				throw new CredentialStoreError("corrupt", "Credential file could not be decrypted.");
+			}
+		}
 		let raw: unknown;
 		try {
 			raw = JSON.parse(text);
@@ -250,7 +264,8 @@ class FileProviderCredentialStore implements ProviderCredentialStore {
 				throw new CredentialStoreError("io", "Credential file is unavailable.");
 			}
 		}
-		const body = `${JSON.stringify({ version: 1, credentials: Object.fromEntries(state) }, null, "\t")}\n`;
+		const plain = `${JSON.stringify({ version: 1, credentials: Object.fromEntries(state) }, null, "\t")}\n`;
+		const body = this.cipher ? this.cipher.encrypt(plain) : plain;
 		const tmp = path.join(this.dir, `.${path.basename(this.file)}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
 		let fd: number | undefined;
 		try {
@@ -480,6 +495,22 @@ class FileProviderCredentialStore implements ProviderCredentialStore {
 		});
 	}
 
+	/** One-time upgrade: rewrite a plaintext file as an encrypted one. No-op without a cipher. */
+	async encryptAtRest(): Promise<void> {
+		if (!this.cipher) return;
+		await this.locked(undefined, async () => {
+			let text: string;
+			try {
+				text = fs.readFileSync(this.file, "utf-8");
+			} catch {
+				return; // absent: the first write will be encrypted
+			}
+			if (isEncryptedEnvelope(text)) return;
+			const state = this.readStateSync();
+			if (state) this.writeState(state);
+		});
+	}
+
 	// ---- sync views ---------------------------------------------------
 
 	peek(providerId: string): Credential | undefined {
@@ -511,7 +542,13 @@ const SINGLETON_KEY = Symbol.for("lh.providerCredentials");
 
 function singleton(): ProviderCredentialStore {
 	const g = globalThis as Record<symbol, ProviderCredentialStore | undefined>;
-	g[SINGLETON_KEY] ??= createProviderCredentialStore(PROVIDER_CREDENTIALS_FILE);
+	if (!g[SINGLETON_KEY]) {
+		const store = new FileProviderCredentialStore(PROVIDER_CREDENTIALS_FILE, { cipher: keychainCipher() });
+		g[SINGLETON_KEY] = store;
+		void store.encryptAtRest().catch(() => {
+			// best effort: the file stays readable and the next write encrypts it
+		});
+	}
 	return g[SINGLETON_KEY];
 }
 
